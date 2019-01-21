@@ -1,0 +1,300 @@
+---
+title: "NFL Playoff Pool 2018"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("googlesheets")
+library("readr")
+library("cellranger")
+library("purrr")
+library("data.table")
+library("ggplot2")
+library("ggthemes")
+library("rvest")
+library("slopegraph")
+library("ggrepel")
+
+selectEndsWith <- function(x, chr, id_cols = NULL) {
+  match_cols <- grep(paste0(chr, "$"), names(x), value = TRUE, ignore.case = TRUE)
+  all_cols   <- unique(c(id_cols, match_cols))
+  x[, all_cols, with = FALSE]
+}
+
+```
+
+
+```{r register-gs, include = FALSE}
+playoff_pool <- gs_title("2018 NFL Playoff Pool")
+scores <- googlesheets:::gs_ws(playoff_pool, "Scores", verbose = FALSE)
+```
+
+```{r playoff-results, include = FALSE}
+playoff_schedule_raw <- read_html("https://en.wikipedia.org/wiki/2018%E2%80%9319_NFL_playoffs") %>%
+  html_nodes(xpath = '//*[@id="mw-content-text"]/div/table[5]') %>%
+  html_table(fill = TRUE, header = TRUE) %>%
+  as.data.table()
+
+setnames(playoff_schedule_raw, c("away_team", "score", "home_team", "date", "kickoff", "tv"))
+
+# categorize the games, this is a table with multiple merged cell rows so we
+# will use the 'round' variable to eliminate them
+playoff_schedule_raw[2:5,   round := "wildcard"]
+playoff_schedule_raw[7:10,  round := "divisional"]
+playoff_schedule_raw[12:13, round := "championship"]
+playoff_schedule_raw[15,    round := "superbowl"]
+
+# eliminate the merged cell rows
+playoff_schedule <- playoff_schedule_raw[!is.na(round)]
+
+# regiseter O/T game or not
+playoff_schedule[, ot := grepl("\\(OT\\)", score)]
+
+# determine winner by score, record "away_win" for when we melt to long form
+playoff_schedule[, score := gsub(" \\(OT\\)", "", score)]
+playoff_schedule[score != "", away_score := as.integer(gsub("(\\d+)–(\\d+)", "\\1", score))]
+playoff_schedule[score != "", home_score := as.integer(gsub("(\\d+)–(\\d+)", "\\2", score))]
+playoff_schedule[, away_win := away_score > home_score]
+
+# melt to long form, register a win for each team for easy merging with player's
+# team later on
+playoff_results <- melt.data.table(
+    data          = playoff_schedule
+  , id.vars       = c("round", "tv", "kickoff", "date", "ot", "away_win")
+  , measure.vars  = c("away_team", "home_team")
+  , variable.name = "away"
+  , value.name    = "team_long_name"
+)
+
+# boolean indicators for win and away calculated
+playoff_results[, away := away == "away_team"]
+playoff_results[away == TRUE, win := away_win]
+playoff_results[away == FALSE, win := !away_win]
+
+```
+
+```{r elo-538}
+rounds <- c("wildcard" = "Wild-card round", "divisional" = "Divisional round", "championship" = "Conference championships")
+
+game_winprob <- map2(rounds, names(rounds), function(title, round) {
+  round_games <- read_html("https://projects.fivethirtyeight.com/2018-nfl-predictions/games/?ex_cid=rrpromo") %>%
+  html_nodes(xpath = paste0('//*[text()="', title, '"]/following-sibling::div')) %>%
+  html_nodes(xpath = ".//table[@class ='game-body']") %>%
+  map(function(node) {
+    raw_table <- html_table(node) %>% as.data.table()
+    raw_table[, .(geog_name = X2, point_spread = X3, win_prob = X4)]
+  }) %>% rbindlist(idcol = "round_game")
+
+  round_games[, round := round]
+  
+  return(round_games)
+}) %>% rbindlist()
+
+game_winprob[, win_prob := gsub("%", "", win_prob) %>% as.integer() %>% `/`(100)]
+game_winprob[, point_spread := as.numeric(point_spread)]
+
+# fill in the point spread for the underdog
+game_winprob[, game_point_spread := min(point_spread, na.rm = TRUE), by = c("round_game", "round")]
+game_winprob[is.na(point_spread), point_spread := -game_point_spread]
+game_winprob[, `:=`(game_point_spread = NULL, round_game = NULL)]
+
+# standardize names to merge with the home/away data
+game_winprob[, geog_name := gsub("L\\.A\\.", "Los Angeles", geog_name)]
+game_winprob[, geog_name := gsub("N\\.Y\\.", "New York", geog_name)]
+```
+
+```{r team-abbreviations, include = FALSE}
+# scrape the team abbreviations from the wiki site
+team_abbr <- read_html("https://en.wikipedia.org/wiki/Wikipedia:WikiProject_National_Football_League/National_Football_League_team_abbreviations") %>%
+  html_nodes(xpath = '//*[@id="mw-content-text"]/div/table[1]') %>%
+  html_table(fill = TRUE, header = TRUE) %>%
+  as.data.table()
+
+setnames(team_abbr, c("team", "team_long_name"))
+
+# the defenses are listed team name only, no geog
+team_abbr[, team_short_name := gsub(".* ([^ ]+)", "\\1", team_long_name)]
+
+# changing this one abbreviation because we never see it used normally
+# change to "NE" instead of "NEP"...
+team_abbr[team_long_name == "New England Patriots", team := "NE"]
+
+# compute the geography specific name, retaining team name for those
+# geogs with more than one team (for merging with 538 data)
+team_abbr[, geog_name := gsub("(.*) [^ ]+", "\\1", team_long_name)]
+team_abbr[geog_name %in% c("Los Angeles", "New York"), geog_name := team_long_name]
+```
+
+```{r data-extract, include = FALSE}
+# we're reading the same block of data for each participant so we set the 
+# structure up here
+point_col_types <- readr::cols(
+    player_position      = col_character()
+  , wildcard_player      = col_character()
+  , wildcard_pts         = col_double()
+  , divisional_player    = col_character()
+  , divisional_pts       = col_double()
+  , championship_player  = col_character()
+  , championship_pts     = col_double()
+  , superbowl_player     = col_character()
+  , superbowl_pts        = col_double()
+)
+
+# the points data is always in relation to the participant name so we define
+# the initial values here and will iterate using that convention in the loop
+participant_r <- 1L
+participant_c <- 2L
+min_r         <- participant_r + 2L
+max_r         <- min_r + 8L
+participants  <- list()
+while (participant_r < scores$row_extent) {
+  
+  # identify the participant name
+  participant_cell  <- c(participant_r, participant_c)
+  participant_cells <- cell_limits(participant_cell, participant_cell)
+  participant       <- gs_read_cellfeed(
+      ss        = playoff_pool
+    , ws        = "Scores"
+    , range     = participant_cells
+    , verbose   = FALSE
+  )$value
+  
+  # read in the participants choices and their resulting points
+  point_cells <- cell_limits(c(min_r, 1L), c(max_r, 9L))
+  participants[[participant]] <- gs_read(
+      ss        = playoff_pool
+    , ws        = "Scores"
+    , range     = point_cells
+    , col_types = point_col_types
+    , col_names = names(point_col_types$cols)
+    , verbose   = FALSE
+  ) %>% as.data.table()
+  
+  # increment for the next participant
+  participant_r <- participant_r + 13L
+  min_r         <- participant_r + 2L
+  max_r         <- min_r + 8L
+}
+
+# stack all the results into a data.table for easy data munging
+all_participants <- rbindlist(participants, idcol = "participant")
+
+# set the player positions unique, automatically recycles across participants
+all_participants[, player_position_uniq := make.unique(player_position, sep = ""), by = participant]
+
+```
+
+```{r, include = FALSE}
+idvars <- c("participant", "player_position", "player_position_uniq")
+rounds <- c("wildcard", "divisional", "championship", "superbowl")
+
+# split out player selection, melt to long form and factor the rounds for plotting
+participant_players <- selectEndsWith(all_participants, "player", idvars) %>%
+  melt.data.table(id.vars = idvars, variable.name = "round", value.name = "player")
+participant_players[, round := factor(gsub("_player", "", round), levels = rounds)]
+
+# fixing misspelling
+participant_players[player == "Patrots", player := "Patriots"]
+
+
+# split out points by player and round, melt to long form and factor the rounds for plotting
+participant_points  <- selectEndsWith(all_participants, "pts", idvars) %>%
+  melt.data.table(id.vars = idvars, variable.name = "round", value.name = "points")
+participant_points[, round := factor(gsub("_pts", "", round), levels = rounds)]
+
+```
+
+```{r point-slopegraphs, echo = FALSE}
+# calculate the total points by round, set keys to order by participant
+# and round to calculate the cumulative sum with the round order correctly
+round_points <- participant_points[, .(round_total = sum(points)), by = .(participant, round)]
+setkey(round_points, participant, round)
+
+# calculate the cumulative points per person by round for the slope graph
+round_points[, cuml_points := cumsum(round_total), by = participant]
+
+# calculate a deficit behind the leader for another view of the slope graph
+round_points[, deficit := cuml_points - max(cuml_points), by = round]
+
+ggslopegraph2(
+    dataframe     = round_points
+  , times         = round
+  , measurement   = cuml_points
+  , grouping      = participant
+  , title         = "Started at the bottom... and I'm still here"
+  , linecolor     = "black"
+  , linethickness = 1
+  , subtitle      = "Cumulative Points"
+  , datatextsize  = 2
+  , caption       = NULL
+)
+
+ggslopegraph2(
+    dataframe     = round_points
+  , times         = round
+  , measurement   = deficit
+  , grouping      = participant
+  , title         = "Started at the bottom... and I'm still here"
+  , linecolor     = "black"
+  , linethickness = 1
+  , subtitle      = "Deficit vs. Leader"
+  , datatextsize  = 2
+  , caption       = NULL
+)
+
+```
+
+
+```{r append-game-info}
+# recombine in long form
+points  <- merge(participant_points, participant_players, by = c(idvars, "round"))
+players <- unique(points[, -c("participant", "points"), with = FALSE])
+players[, team := gsub(".* ([A-Za-z]+)", "\\1", player)]
+
+# translate the defenses into the abbreviations to match the other players
+players_d <- merge(players, team_abbr[, .(team_short_name, team)], by.x = "team", by.y = "team_short_name", all.x = TRUE, suffixes = c("", "_ref"))
+players_d[player_position == "D", team := team_ref]
+players_d[, team_ref := NULL]
+
+player_teams <- merge(players_d, team_abbr, by = "team", all.x = TRUE) %>%
+  merge(playoff_results, by = c("round", "team_long_name"), all.x = TRUE) %>%
+  merge(game_winprob, by = c("round", "geog_name"), all.x = TRUE)
+
+participant_players <- merge(points, player_teams, by = c("round", "player", "player_position", "player_position_uniq"))
+
+
+# factor participants in terms of overall place
+part_levels <- participant_players[, .(total = sum(points)), by = participant][order(-total)]$participant
+participant_players[, participant := factor(participant, levels = part_levels)]
+```
+
+
+```{r winprob-players}
+
+lk <- participant_players[, .(away = sum(away), win_prob_mean = mean(win_prob), points = sum(points)), by = .(participant, round)]
+
+ggplot(lk, aes(away, win_prob_mean, color = participant, label = participant)) + geom_point(aes(size = points))+
+  geom_label_repel(
+      box.padding   = 0.35
+    , point.padding = 0.5
+    , segment.color = 'grey50'
+  ) + 
+  facet_wrap(~round) +
+  scale_y_continuous(labels = scales::percent, breaks = scales::pretty_breaks(6)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(6)) +
+  theme_tufte(ticks = FALSE) +
+  labs(x = "\nNumber of Away Players", y = "Team Win Probability/n")
+
+
+
+lk <- participant_players[, .(away = sum(away), win_prob_mean = mean(win_prob), points = sum(points)), by = .(participant, player_position)]
+
+lk[, point_perc := points / sum(points), by = .(participant)]
+
+
+ggplot(lk, aes(x = participant, y = points, fill = player_position)) + geom_bar(stat = "identity")  + geom_label(aes(label = scales::percent(point_perc)), position = "stack")
+
+ ```
